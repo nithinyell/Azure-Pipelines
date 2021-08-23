@@ -1,0 +1,193 @@
+# Starter pipeline
+# Nithin Yell
+
+trigger:
+- '$(sourceBranch)'
+
+pool:
+  vmImage: 'macos-latest'
+
+parameters:
+- name: variablegroupname
+  displayName: variablegroupname
+  values:
+  - Dev
+  - Stab
+  - Stage
+  - Beta
+  - Prod
+  default: Dev
+
+- name: runAndroid
+  displayName: Run Android
+  type: boolean
+  default: true
+
+- name: distributeAdroidBuild
+  displayName: Distribute Dev Android Build via App Center
+  type: boolean
+  default: false
+
+- name: runiOS
+  displayName: Run iOS
+  type: boolean
+  default: true
+
+- name: distributeiOSBuild
+  displayName: Distribute Dev iOS Build via App Center
+  type: boolean
+  default: false
+
+variables:
+  - group: ${{ parameters.variablegroupname }}
+  - name: sourceBranch
+    value: '$(Build.SourceBranchName)'
+  - name: buildNumber
+    value: '$(Build.BuildNumber)'
+
+# For Dog Food
+  - name: dogfoodCert
+    value: '$(Dogfood_Cert)'
+  - name: dogfoodCertPass
+    value: '$(Dogfood_Cert_Pass)'
+  - name: dogfoodProvision
+    value: '$(Dogfood_Provision)'
+
+jobs:
+- job: BuildApps
+  steps:
+  
+# React Native Set Up - Omit this two steps for Native apps
+    - task: NodeTool@0
+      displayName: 'Install Node'
+      inputs:
+        versionSpec: '14.0'
+    - script: npm install
+      workingDirectory: SampleApp
+      displayName: 'Install node dependencies'
+
+# Android
+    - ${{ if eq(parameters.runAndroid, true) }}:
+      - task: Gradle@2
+        inputs:
+          workingDirectory: 'SampleApp/android'
+          gradleWrapperFile: 'SampleApp/android/gradlew'
+          options: '-PAPPCENTER_KEY_ANDROID=$(APPCENTER_KEY_ANDROID)' # I have added this for App Center Analytics, Omit if not required
+          gradleOptions: '-Xmx3072m'
+          publishJUnitResults: false
+          testResultsFiles: '**/TEST-*.xml'
+          tasks: 'assembleRelease'
+
+      - task: AndroidSigning@3
+        displayName: Android Sign In
+        inputs:
+          apkFiles: '**/*.apk'
+          apksign: true
+          apksignerKeystoreFile: '$(keyStore)'
+          apksignerKeystorePassword: '$(passcode)'
+          apksignerKeystoreAlias: '$(alias)'
+          apksignerKeyPassword: '$(passcode)'
+          zipalign: true
+        
+      - script: mv SampleApp/android/app/build/outputs/apk/release/app-release.apk SampleApp/android/app/build/outputs/apk/release/SampleApp-$(sourceBranch)-$(buildNumber).apk
+        displayName: 'Rename Android artifact to include build number'
+
+      - task: PublishBuildArtifacts@1
+        displayName: Publish Android Artifacts
+        inputs:
+          PathtoPublish: 'SampleApp/android/app/build/outputs/apk/release'
+          ArtifactName: 'drop'
+          publishLocation: 'Container'
+
+      - ${{ if eq(parameters.distributeAdroidBuild, true) }}:
+        - task: AppCenterDistribute@3
+          displayName: Release Android to App Center
+          inputs:
+            serverEndpoint: 'AppCenter - Android'
+            appSlug: 'Your Slug'
+            appFile: 'SampleApp/android/app/build/outputs/apk/release/SampleApp-$(sourceBranch)-$(buildNumber).apk'
+            symbolsOption: 'Android'
+            releaseNotesOption: 'input'
+            releaseNotesInput: |
+              Commit Message: $(Build.SourceVersionMessage)
+
+              Commit ID: $(Build.SourceVersion) 
+
+              Release Notes: This is an automated release from Azure DevOps
+            destinationType: 'groups'
+            distributionGroupId: 'XXXXXXXX-XXXX-XXXX-XXXX-e7954adcXXXX'
+
+# iOS
+    - ${{ if eq(parameters.runiOS, true) }}:
+
+      # I have added this for App Center Analytics, Omit if not required
+      - script: plutil -replace AppSecret -string '$(APPCENTER_KEY_IOS)' v/ios/AppCenter-Config.plist && cat SampleApp/ios/AppCenter-Config.plist
+        displayName: Update App Secret for iOS
+
+      - task: CocoaPods@0
+        displayName: Install Pods
+        inputs:
+          workingDirectory: 'SampleApp/ios/'
+          forceRepoUpdate: false
+
+      - task: InstallAppleCertificate@2
+        displayName: "Install Apple Certificate"
+        inputs:
+          certSecureFile: '$(Dogfood_Cert)'
+          certPwd: '$(Dogfood_Cert_Pass)'
+          keychain: temp
+          deleteCert: true
+
+      - task: InstallAppleProvisioningProfile@1
+        displayName: "Install Apple provisioning profile"
+        inputs:
+          provisioningProfileLocation: 'secureFiles'
+          provProfileSecureFile: '$(Dogfood_Provision)'
+          removeProfile: true
+
+      - task: Xcode@5
+        displayName: "Build iOS Application"
+        inputs:
+          actions: 'build'
+          configuration: 'Release'
+          xcWorkspacePath: 'SampleApp/ios/SampleApp.xcworkspace'
+          scheme: 'SampleApp'
+          sdk: 'iphoneos'
+          packageApp: true
+          exportPath: 'output/package'
+          archivePath: 'output/archive'
+          signingOption: 'manual'
+          xcodeVersion: 'specifyPath'
+          signingIdentity: '$(APPLE_CERTIFICATE_SIGNING_IDENTITY)'
+          provisioningProfileUuid: '$(APPLE_PROV_PROFILE_UUID)'
+          xcodeDeveloperDir: '/Applications/Xcode_12.4.app/Contents/Developer'
+
+      - task: CmdLine@2
+        displayName: "Rename iOS artifact to include build number"
+        inputs:
+          script: 'mv output/package/SampleApp.ipa output/package/SampleApp-$(sourceBranch)-$(buildNumber).ipa'
+
+      - task: PublishBuildArtifacts@1
+        displayName: "Publish Build Artifact"
+        inputs:
+          PathtoPublish: 'output/package/SampleApp-$(sourceBranch)-$(buildNumber).ipa'
+          ArtifactName: 'drop'
+          publishLocation: 'Container'
+
+      - ${{ if eq(parameters.distributeAdroidBuild, true) }}:
+        - task: AppCenterDistribute@3
+          displayName: Release iOS to App Center
+          inputs:
+            serverEndpoint: 'AppCenter - iOS'
+            appSlug: 'SampleApp-Mobile/SampleApp-V2-Dev-IOS'
+            appFile: 'output/package/SampleApp-$(sourceBranch)-$(buildNumber).ipa'
+            symbolsOption: 'apple'
+            releaseNotesOption: 'input'
+            releaseNotesInput: |
+              Commit Message: $(Build.SourceVersionMessage)
+
+              Commit ID: $(Build.SourceVersion) 
+
+              Release Notes: This is an automated release from Azure DevOps
+            destinationType: 'groups'
+            distributionGroupId: 'XXXXXXXX-XXXX-XXXX-XXXX-6291e5dcXXXX'
